@@ -1,8 +1,11 @@
 from pathlib import Path
+import re
+import unicodedata
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
@@ -93,6 +96,57 @@ def load_data():
     return df
 
 
+def normalize_title(value):
+    value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
+def get_player_photo(player_name, squad):
+    """Find a matching Wikipedia page thumbnail; return None if no confident match exists."""
+    api_url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": f'"{player_name}" footballer {squad}',
+        "gsrnamespace": 0,
+        "gsrlimit": 8,
+        "prop": "pageimages|pageterms",
+        "piprop": "thumbnail",
+        "pithumbsize": 400,
+        "wbptterms": "description",
+    }
+    headers = {"User-Agent": "FootballPlayerScout/1.0 (educational project)"}
+    wanted = normalize_title(player_name)
+
+    try:
+        response = requests.get(api_url, params=params, headers=headers, timeout=8)
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", {})
+    except (requests.RequestException, ValueError):
+        return None
+
+    candidates = []
+    for page in pages.values():
+        title = page.get("title", "")
+        title_key = normalize_title(title)
+        if title_key == wanted:
+            match_rank = 0
+        elif title_key.startswith(wanted) and len(title_key) - len(wanted) <= 28:
+            match_rank = 1
+        else:
+            continue
+        thumbnail = page.get("thumbnail", {}).get("source")
+        if thumbnail:
+            candidates.append((match_rank, page.get("index", 999), thumbnail))
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+
 try:
     players = load_data()
 except Exception as exc:
@@ -129,11 +183,27 @@ if role_df.empty:
     st.stop()
 
 
+search_text = st.sidebar.text_input(
+    "Cari nama pemain",
+    placeholder="Ketik nama, misalnya Kai Havertz",
+).strip()
+if search_text:
+    search_mask = role_df["Player"].astype(str).str.contains(
+        re.escape(search_text), case=False, na=False
+    )
+    search_df = role_df.loc[search_mask]
+else:
+    search_df = role_df
+
+if search_df.empty:
+    st.sidebar.warning("Nama pemain tidak ditemukan pada peran ini.")
+    st.stop()
+
 def player_label(index):
-    row = role_df.loc[index]
+    row = search_df.loc[index]
     return f"{row['Player']} — {row['Squad']} ({row['Comp']})"
 
-player_indices = role_df.index.tolist()
+player_indices = search_df.index.tolist()
 selected_index = st.sidebar.selectbox(
     "Pilih pemain",
     options=player_indices,
@@ -154,15 +224,27 @@ candidate_mask = (
 candidate_positions = np.flatnonzero(candidate_mask.to_numpy())
 
 st.subheader("Pemain pilihan")
-profile_cols = st.columns([2, 1, 1, 1])
+profile_cols = st.columns([1, 3, 1, 1, 1])
+selected_photo = get_player_photo(str(selected["Player"]), str(selected["Squad"]))
 with profile_cols[0]:
+    if selected_photo:
+        st.image(selected_photo, width=112)
+    else:
+        initials = "".join(part[0] for part in str(selected["Player"]).split() if part)[:2].upper()
+        st.markdown(
+            f"<div style='width:96px;height:96px;border-radius:18px;background:#173e31;"
+            f"color:#78e6ac;display:flex;align-items:center;justify-content:center;"
+            f"font-size:30px;font-weight:700'>{initials or '⚽'}</div>",
+            unsafe_allow_html=True,
+        )
+with profile_cols[1]:
     st.markdown(f"### {selected['Player']}")
     st.caption(f"{selected['Pos']} · {selected['Squad']} · {selected['Comp']}")
-with profile_cols[1]:
-    st.metric("Menit bermain", f"{int(selected['Min']):,}")
 with profile_cols[2]:
-    st.metric("Pertandingan", f"{int(selected['MP'])}")
+    st.metric("Menit bermain", f"{int(selected['Min']):,}")
 with profile_cols[3]:
+    st.metric("Pertandingan", f"{int(selected['MP'])}")
+with profile_cols[4]:
     st.metric("Usia", "—" if pd.isna(selected["Age"]) else f"{selected['Age']:.0f}")
 
 if len(candidate_positions) == 0:
@@ -177,8 +259,20 @@ recommendations = recommendations.sort_values("Similarity", ascending=False).hea
 
 st.subheader("Pemain dengan statistik serupa")
 for rank, (_, player) in enumerate(recommendations.iterrows(), start=1):
-    left, right = st.columns([5, 1])
-    with left:
+    photo_col, details_col, score_col = st.columns([1, 5, 1])
+    photo = get_player_photo(str(player["Player"]), str(player["Squad"]))
+    with photo_col:
+        if photo:
+            st.image(photo, width=82)
+        else:
+            initials = "".join(part[0] for part in str(player["Player"]).split() if part)[:2].upper()
+            st.markdown(
+                f"<div style='width:68px;height:68px;border-radius:14px;background:#173e31;"
+                f"color:#78e6ac;display:flex;align-items:center;justify-content:center;"
+                f"font-size:23px;font-weight:700'>{initials or '⚽'}</div>",
+                unsafe_allow_html=True,
+            )
+    with details_col:
         st.markdown(
             f"""
             <div class="rec-card">
@@ -189,7 +283,7 @@ for rank, (_, player) in enumerate(recommendations.iterrows(), start=1):
             """,
             unsafe_allow_html=True,
         )
-    with right:
+    with score_col:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(
             f'<div class="score">Cosine<br>{player["Similarity"]:.3f}</div>',
