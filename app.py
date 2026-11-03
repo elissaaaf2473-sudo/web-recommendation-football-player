@@ -101,20 +101,19 @@ def normalize_title(value):
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-@st.cache_data(ttl=86400, max_entries=1024, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=2048, show_spinner=False)
 def get_player_photo(player_name, squad):
-    """Try a football-player image API first, then a matching Wikipedia thumbnail."""
+    """Search football and Wikimedia sources in order; use only name-matched images."""
     wanted = normalize_title(player_name)
     squad_key = normalize_title(squad)
+    tokens = [normalize_title(token) for token in str(player_name).split() if len(token) > 2]
     headers = {"User-Agent": "FootballPlayerScout/1.0 (educational project)"}
 
-    # TheSportsDB has player-specific cutout and thumbnail fields.
+    # 1. TheSportsDB: football-specific cutout or thumbnail.
     try:
         response = requests.get(
-            f"https://www.thesportsdb.com/api/v1/json/3/searchplayers.php",
-            params={"p": player_name},
-            headers=headers,
-            timeout=8,
+            "https://www.thesportsdb.com/api/v1/json/3/searchplayers.php",
+            params={"p": player_name}, headers=headers, timeout=5,
         )
         response.raise_for_status()
         records = response.json().get("player") or []
@@ -138,48 +137,114 @@ def get_player_photo(player_name, squad):
     except (requests.RequestException, ValueError):
         pass
 
-    # Fallback: search Wikipedia and accept an exact, extended, or token-complete title.
-    api_url = "https://en.wikipedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": f'"{player_name}" footballer {squad}',
-        "gsrnamespace": 0,
-        "gsrlimit": 8,
-        "prop": "pageimages|pageterms",
-        "piprop": "thumbnail",
-        "pithumbsize": 400,
-        "wbptterms": "description",
-    }
-    tokens = [normalize_title(token) for token in str(player_name).split() if len(token) > 2]
-
+    # 2. Wikipedia page thumbnail.
     try:
-        response = requests.get(api_url, params=params, headers=headers, timeout=8)
+        response = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query", "format": "json", "generator": "search",
+                "gsrsearch": f'"{player_name}" footballer {squad}',
+                "gsrnamespace": 0, "gsrlimit": 8,
+                "prop": "pageimages|pageterms", "piprop": "thumbnail",
+                "pithumbsize": 400, "wbptterms": "description",
+            },
+            headers=headers, timeout=5,
+        )
         response.raise_for_status()
         pages = response.json().get("query", {}).get("pages", {})
+        candidates = []
+        for page in pages.values():
+            title_key = normalize_title(page.get("title", ""))
+            if title_key == wanted:
+                rank = 0
+            elif title_key.startswith(wanted) and len(title_key) - len(wanted) <= 40:
+                rank = 1
+            elif tokens and all(token in title_key for token in tokens):
+                rank = 2
+            else:
+                continue
+            thumbnail = page.get("thumbnail", {}).get("source")
+            if thumbnail:
+                candidates.append((rank, page.get("index", 999), thumbnail))
+        if candidates:
+            candidates.sort()
+            return candidates[0][2]
     except (requests.RequestException, ValueError):
-        return None
+        pass
 
-    candidates = []
-    for page in pages.values():
-        title_key = normalize_title(page.get("title", ""))
-        if title_key == wanted:
-            match_rank = 0
-        elif title_key.startswith(wanted) and len(title_key) - len(wanted) <= 40:
-            match_rank = 1
-        elif tokens and all(token in title_key for token in tokens):
-            match_rank = 2
-        else:
-            continue
-        thumbnail = page.get("thumbnail", {}).get("source")
-        if thumbnail:
-            candidates.append((match_rank, page.get("index", 999), thumbnail))
+    # 3. Wikimedia Commons: search filenames for the complete player name.
+    try:
+        response = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query", "format": "json", "generator": "search",
+                "gsrsearch": f'"{player_name}" footballer',
+                "gsrnamespace": 6, "gsrlimit": 10,
+                "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 400,
+            },
+            headers=headers, timeout=5,
+        )
+        response.raise_for_status()
+        pages = response.json().get("query", {}).get("pages", {})
+        candidates = []
+        for page in pages.values():
+            title_key = normalize_title(page.get("title", ""))
+            if tokens and all(token in title_key for token in tokens):
+                image_info = (page.get("imageinfo") or [{}])[0]
+                image = image_info.get("thumburl") or image_info.get("url")
+                if image:
+                    candidates.append((page.get("index", 999), image))
+        if candidates:
+            candidates.sort()
+            return candidates[0][1]
+    except (requests.RequestException, ValueError):
+        pass
 
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[0][2]
+    # 4. Wikidata: use a footballer entity's P18 (image) claim, if available.
+    try:
+        response = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "wbsearchentities", "format": "json",
+                "language": "en", "limit": 8,
+                "search": f"{player_name} footballer",
+            },
+            headers=headers, timeout=5,
+        )
+        response.raise_for_status()
+        entities = response.json().get("search", [])
+        entity_candidates = []
+        for entity in entities:
+            label_key = normalize_title(entity.get("label", ""))
+            description = str(entity.get("description", "")).lower()
+            if not (label_key == wanted or (tokens and all(t in label_key for t in tokens))):
+                continue
+            if "football" not in description and "soccer" not in description:
+                continue
+            entity_candidates.append(entity.get("id"))
+        entity_ids = [entity_id for entity_id in entity_candidates if entity_id]
+        if entity_ids:
+            response = requests.get(
+                "https://www.wikidata.org/w/api.php",
+                params={
+                    "action": "wbgetentities", "format": "json",
+                    "ids": "|".join(entity_ids[:5]), "props": "claims",
+                },
+                headers=headers, timeout=5,
+            )
+            response.raise_for_status()
+            entities = response.json().get("entities", {})
+            for entity_id in entity_ids:
+                claims = entities.get(entity_id, {}).get("claims", {})
+                statements = claims.get("P18", [])
+                if statements:
+                    filename = statements[0]["mainsnak"]["datavalue"]["value"]
+                    encoded = requests.utils.quote(filename.replace(" ", "_"), safe="()!,._-")
+                    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{encoded}?width=400"
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pass
+
+    return None
 
 
 try:
@@ -229,8 +294,11 @@ search_df = players.loc[players.index.isin(valid_indices)].copy()
 if role_filter != "Semua peran":
     search_df = search_df.loc[search_df["Role"] == role_filter]
 if search_text:
-    search_mask = search_df["Player"].astype(str).str.contains(
-        re.escape(search_text), case=False, na=False
+    # Normalize accents/punctuation so "dembele" matches "Dembélé".
+    normalized_query = normalize_title(search_text)
+    normalized_names = search_df["Player"].astype(str).map(normalize_title)
+    search_mask = normalized_names.str.contains(
+        re.escape(normalized_query), case=False, na=False
     )
     search_df = search_df.loc[search_mask]
 
@@ -253,18 +321,6 @@ features = FEATURES_BY_ROLE[role]
 role_df = players.loc[players["Role"] == role].dropna(subset=features).copy()
 selected = role_df.loc[selected_index]
 
-
-def player_label(index):
-    row = search_df.loc[index]
-    return f"{row['Player']} — {row['Squad']} ({row['Comp']})"
-
-player_indices = search_df.index.tolist()
-selected_index = st.sidebar.selectbox(
-    "Pilih pemain",
-    options=player_indices,
-    format_func=player_label,
-)
-selected = role_df.loc[selected_index]
 
 # Skalakan dalam kelompok peran yang sama, seperti pada eksperimen notebook.
 scaler = StandardScaler()
