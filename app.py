@@ -101,9 +101,44 @@ def normalize_title(value):
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-@st.cache_data(ttl=86400, max_entries=512, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=1024, show_spinner=False)
 def get_player_photo(player_name, squad):
-    """Find a matching Wikipedia page thumbnail; return None if no confident match exists."""
+    """Try a football-player image API first, then a matching Wikipedia thumbnail."""
+    wanted = normalize_title(player_name)
+    squad_key = normalize_title(squad)
+    headers = {"User-Agent": "FootballPlayerScout/1.0 (educational project)"}
+
+    # TheSportsDB has player-specific cutout and thumbnail fields.
+    try:
+        response = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/3/searchplayers.php",
+            params={"p": player_name},
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        records = response.json().get("player") or []
+        matches = []
+        for record in records:
+            result_name = normalize_title(record.get("strPlayer", ""))
+            sport = str(record.get("strSport", "")).lower()
+            if result_name != wanted or sport not in {"soccer", "football"}:
+                continue
+            result_team = normalize_title(record.get("strTeam", ""))
+            team_match = bool(
+                squad_key and result_team and
+                (squad_key in result_team or result_team in squad_key)
+            )
+            image = record.get("strCutout") or record.get("strThumb")
+            if image:
+                matches.append((0 if team_match else 1, image))
+        if matches:
+            matches.sort(key=lambda item: item[0])
+            return matches[0][1]
+    except (requests.RequestException, ValueError):
+        pass
+
+    # Fallback: search Wikipedia and accept an exact, extended, or token-complete title.
     api_url = "https://en.wikipedia.org/w/api.php"
     params = {
         "action": "query",
@@ -117,8 +152,7 @@ def get_player_photo(player_name, squad):
         "pithumbsize": 400,
         "wbptterms": "description",
     }
-    headers = {"User-Agent": "FootballPlayerScout/1.0 (educational project)"}
-    wanted = normalize_title(player_name)
+    tokens = [normalize_title(token) for token in str(player_name).split() if len(token) > 2]
 
     try:
         response = requests.get(api_url, params=params, headers=headers, timeout=8)
@@ -129,12 +163,13 @@ def get_player_photo(player_name, squad):
 
     candidates = []
     for page in pages.values():
-        title = page.get("title", "")
-        title_key = normalize_title(title)
+        title_key = normalize_title(page.get("title", ""))
         if title_key == wanted:
             match_rank = 0
-        elif title_key.startswith(wanted) and len(title_key) - len(wanted) <= 28:
+        elif title_key.startswith(wanted) and len(title_key) - len(wanted) <= 40:
             match_rank = 1
+        elif tokens and all(token in title_key for token in tokens):
+            match_rank = 2
         else:
             continue
         thumbnail = page.get("thumbnail", {}).get("source")
@@ -165,7 +200,8 @@ st.markdown(
 
 st.sidebar.header("Atur pencarian")
 roles_available = [r for r in ["FW", "MF", "DF", "GK"] if (players["Role"] == r).any()]
-role = st.sidebar.selectbox("Peran pemain", roles_available)
+role_filter_options = ["Semua peran"] + roles_available
+role_filter = st.sidebar.selectbox("Filter posisi (opsional)", role_filter_options, index=0)
 min_minutes = st.sidebar.slider(
     "Minimal menit kandidat",
     min_value=90,
@@ -175,29 +211,48 @@ min_minutes = st.sidebar.slider(
     help="Ambang ini hanya menyaring pemain kandidat yang direkomendasikan.",
 )
 top_n = st.sidebar.slider("Jumlah rekomendasi", 3, 10, 5)
-
-features = FEATURES_BY_ROLE[role]
-role_df = players.loc[players["Role"] == role].dropna(subset=features).copy()
-if role_df.empty:
-    st.warning("Belum ada pemain dengan statistik lengkap untuk peran ini.")
-    st.stop()
-
-
 search_text = st.sidebar.text_input(
     "Cari nama pemain",
-    placeholder="Ketik nama, misalnya Kai Havertz",
+    placeholder="Ketik sebagian nama, misalnya haaland",
 ).strip()
+
+# Hanya tampilkan pemain yang fitur statistiknya cukup lengkap untuk perannya.
+valid_indices = []
+for available_role in roles_available:
+    role_features_for_filter = FEATURES_BY_ROLE[available_role]
+    valid_indices.extend(
+        players.loc[players["Role"] == available_role]
+        .dropna(subset=role_features_for_filter)
+        .index.tolist()
+    )
+search_df = players.loc[players.index.isin(valid_indices)].copy()
+if role_filter != "Semua peran":
+    search_df = search_df.loc[search_df["Role"] == role_filter]
 if search_text:
-    search_mask = role_df["Player"].astype(str).str.contains(
+    search_mask = search_df["Player"].astype(str).str.contains(
         re.escape(search_text), case=False, na=False
     )
-    search_df = role_df.loc[search_mask]
-else:
-    search_df = role_df
+    search_df = search_df.loc[search_mask]
 
 if search_df.empty:
-    st.sidebar.warning("Nama pemain tidak ditemukan pada peran ini.")
+    st.sidebar.warning("Nama pemain tidak ditemukan. Coba kata lain atau pilih Semua peran.")
     st.stop()
+
+# Peran rekomendasi ditentukan otomatis dari pemain yang dipilih.
+selected_index = st.sidebar.selectbox(
+    "Pilih pemain",
+    options=search_df.index.tolist(),
+    format_func=lambda index: (
+        f"{search_df.loc[index, 'Player']} — {search_df.loc[index, 'Pos']} · "
+        f"{search_df.loc[index, 'Squad']} ({search_df.loc[index, 'Comp']})"
+    ),
+)
+selected = players.loc[selected_index]
+role = selected["Role"]
+features = FEATURES_BY_ROLE[role]
+role_df = players.loc[players["Role"] == role].dropna(subset=features).copy()
+selected = role_df.loc[selected_index]
+
 
 def player_label(index):
     row = search_df.loc[index]
