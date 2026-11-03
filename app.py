@@ -1,85 +1,260 @@
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
-import ipywidgets as widgets
-from IPython.display import display, clear_output
+import pandas as pd
+import streamlit as st
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
 
-hasil_radar = widgets.Output()
-display(hasil_radar)
+DATA_FILE = Path(__file__).parent / "players_data-2026_2027.csv"
+MIN_ANALYSIS_MINUTES = 90
+DEFAULT_RECOMMENDATION_MINUTES = 270
 
-def tampilkan_radar(_=None):
-    with hasil_radar:
-        clear_output(wait=True)
+OUTFIELD_BASE = ["Gls", "Ast", "Sh", "SoT", "Crs", "TklW", "Int"]
+OUTFIELD_FEATURES = [f"{col}_per90" for col in OUTFIELD_BASE]
+GOALKEEPER_FEATURES = ["GA90", "Save%", "CS%"]
+FEATURES_BY_ROLE = {
+    "FW": OUTFIELD_FEATURES,
+    "MF": OUTFIELD_FEATURES,
+    "DF": OUTFIELD_FEATURES,
+    "GK": GOALKEEPER_FEATURES,
+}
+K_BY_ROLE = {"FW": 4, "MF": 2, "DF": 2, "GK": 3}
 
-        nama = pilihan_pemain.value
-        pilihan = df_eligible[df_eligible['Player'] == nama].iloc[0]
-        role = pilihan['Role']
-        fitur = role_features[role]
-        rekomendasi = rekomendasikan_pemain(
-            nama,
-            top_n=3,
-            min_menit=batas_menit.value
+st.set_page_config(
+    page_title="Football Player Scout",
+    page_icon="⚽",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 2rem; max-width: 1180px;}
+      .hero {padding: 1.5rem 1.7rem; border-radius: 18px;
+             background: linear-gradient(120deg,#10251e,#132c3a); margin-bottom: 1rem;}
+      .hero h1 {margin: 0; color: #f4fff8;}
+      .hero p {margin: .45rem 0 0; color: #b9d4ca;}
+      .rec-card {padding: 1rem 1.1rem; border: 1px solid #263d48;
+                 border-radius: 14px; margin: .55rem 0; background: #13232c;}
+      .rec-name {font-size: 1.1rem; font-weight: 700;}
+      .rec-meta {color: #b3c1c9; font-size: .9rem; margin-top: .25rem;}
+      .score {color: #58e6a3; font-weight: 700; font-size: 1.05rem;}
+      .note {color: #a9bac2; font-size: .85rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_data(show_spinner="Membaca dan menyiapkan statistik pemain...")
+def load_data():
+    if not DATA_FILE.exists():
+        raise FileNotFoundError(
+            f"File data tidak ditemukan: {DATA_FILE.name}. "
+            "Letakkan CSV utama di folder yang sama dengan app.py."
         )
 
-        if rekomendasi is None or rekomendasi.empty:
-            print("Tidak ada rekomendasi untuk batas menit tersebut.")
-            return
+    df = pd.read_csv(DATA_FILE)
+    required = ["Player", "Pos", "Squad", "Comp", "Age", "MP", "Min"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"Kolom wajib tidak ditemukan di CSV: {missing}")
 
-        # Persentil dihitung di antara pemain dengan peran yang sama.
-        role_df = df_eligible[df_eligible['Role'] == role]
-        percentile = role_df[fitur].rank(pct=True)
+    numeric_cols = set(OUTFIELD_BASE + ["GA90", "Save%", "CS%"])
+    numeric_cols.update(["Min", "Age", "MP"])
+    for col in numeric_cols.intersection(df.columns):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Untuk kiper, GA90 yang lebih rendah berarti lebih baik.
-        if role == 'GK' and 'GA90' in fitur:
-            percentile['GA90'] = 1 - percentile['GA90']
+    df["Role"] = df["Pos"].fillna("").astype(str).str.split(",").str[0].str.strip()
+    df = df.loc[df["Min"] >= MIN_ANALYSIS_MINUTES].copy()
+    denominator = df["Min"].replace(0, np.nan) / 90
+    for col in OUTFIELD_BASE:
+        if col in df.columns:
+            df[f"{col}_per90"] = df[col] / denominator
 
-        nama_fitur = {
-            'Gls_per90': 'Gol/90',
-            'Ast_per90': 'Assist/90',
-            'Sh_per90': 'Tembakan/90',
-            'SoT_per90': 'Tepat sasaran/90',
-            'Crs_per90': 'Umpan silang/90',
-            'TklW_per90': 'Tekel/90',
-            'Int_per90': 'Intersepsi/90',
-            'GA90': 'Kebobolan/90*',
-            'Save%': 'Save%',
-            'CS%': 'Clean sheet%'
-        }
+    df["Cluster"] = -1
+    for role, features in FEATURES_BY_ROLE.items():
+        role_df = df.loc[df["Role"] == role].dropna(subset=features)
+        if len(role_df) < 2:
+            continue
+        X = StandardScaler().fit_transform(role_df[features])
+        n_clusters = min(K_BY_ROLE[role], len(role_df) - 1)
+        if n_clusters >= 2:
+            labels = KMeans(
+                n_clusters=n_clusters,
+                random_state=42,
+                n_init=10,
+            ).fit_predict(X)
+            df.loc[role_df.index, "Cluster"] = labels
 
-        labels = [nama_fitur.get(f, f) for f in fitur]
-        sudut = np.linspace(0, 2 * np.pi, len(fitur), endpoint=False).tolist()
-        sudut += sudut[:1]
+    return df
 
-        fig, ax = plt.subplots(figsize=(7, 6), subplot_kw={'polar': True})
 
-        # Garis pemain pilihan
-        idx_pilihan = pilihan.name
-        nilai = percentile.loc[idx_pilihan, fitur].tolist()
-        nilai += nilai[:1]
-        ax.plot(sudut, nilai, linewidth=2.5, label=f"{nama} (pilihan)")
-        ax.fill(sudut, nilai, alpha=0.12)
+try:
+    players = load_data()
+except Exception as exc:
+    st.error(str(exc))
+    st.stop()
 
-        # Garis tiga rekomendasi teratas
-        for idx, (_, pemain) in enumerate(rekomendasi.iterrows(), start=1):
-            nilai = percentile.loc[pemain.name, fitur].tolist()
-            nilai += nilai[:1]
-            ax.plot(sudut, nilai, linewidth=1.5, label=pemain['Player'])
-            ax.fill(sudut, nilai, alpha=0.04)
+st.markdown(
+    """
+    <div class="hero">
+      <h1>⚽ Football Player Scout</h1>
+      <p>Temukan pemain dengan profil statistik yang mirip, dalam peran bermain yang sama.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-        ax.set_xticks(sudut[:-1])
-        ax.set_xticklabels(labels)
-        ax.set_ylim(0, 1)
-        ax.set_yticks([0.25, 0.50, 0.75, 1.0])
-        ax.set_yticklabels(['25', '50', '75', '100'])
-        ax.set_title(
-            f"Perbandingan profil {role} — persentil dalam peran yang sama",
-            pad=24
+st.sidebar.header("Atur pencarian")
+roles_available = [r for r in ["FW", "MF", "DF", "GK"] if (players["Role"] == r).any()]
+role = st.sidebar.selectbox("Peran pemain", roles_available)
+min_minutes = st.sidebar.slider(
+    "Minimal menit kandidat",
+    min_value=90,
+    max_value=900,
+    value=DEFAULT_RECOMMENDATION_MINUTES,
+    step=90,
+    help="Ambang ini hanya menyaring pemain kandidat yang direkomendasikan.",
+)
+top_n = st.sidebar.slider("Jumlah rekomendasi", 3, 10, 5)
+
+features = FEATURES_BY_ROLE[role]
+role_df = players.loc[players["Role"] == role].dropna(subset=features).copy()
+if role_df.empty:
+    st.warning("Belum ada pemain dengan statistik lengkap untuk peran ini.")
+    st.stop()
+
+
+def player_label(index):
+    row = role_df.loc[index]
+    return f"{row['Player']} — {row['Squad']} ({row['Comp']})"
+
+player_indices = role_df.index.tolist()
+selected_index = st.sidebar.selectbox(
+    "Pilih pemain",
+    options=player_indices,
+    format_func=player_label,
+)
+selected = role_df.loc[selected_index]
+
+# Skalakan dalam kelompok peran yang sama, seperti pada eksperimen notebook.
+scaler = StandardScaler()
+X_role = scaler.fit_transform(role_df[features])
+selected_position = role_df.index.get_loc(selected_index)
+query_vector = X_role[[selected_position]]
+
+candidate_mask = (
+    (role_df["Min"] >= min_minutes)
+    & (role_df.index != selected_index)
+)
+candidate_positions = np.flatnonzero(candidate_mask.to_numpy())
+
+st.subheader("Pemain pilihan")
+profile_cols = st.columns([2, 1, 1, 1])
+with profile_cols[0]:
+    st.markdown(f"### {selected['Player']}")
+    st.caption(f"{selected['Pos']} · {selected['Squad']} · {selected['Comp']}")
+with profile_cols[1]:
+    st.metric("Menit bermain", f"{int(selected['Min']):,}")
+with profile_cols[2]:
+    st.metric("Pertandingan", f"{int(selected['MP'])}")
+with profile_cols[3]:
+    st.metric("Usia", "—" if pd.isna(selected["Age"]) else f"{selected['Age']:.0f}")
+
+if len(candidate_positions) == 0:
+    st.info("Tidak ada kandidat yang memenuhi batas menit. Coba turunkan nilai minimal menit.")
+    st.stop()
+
+candidate_matrix = X_role[candidate_positions]
+scores = cosine_similarity(query_vector, candidate_matrix)[0]
+recommendations = role_df.iloc[candidate_positions].copy()
+recommendations["Similarity"] = scores
+recommendations = recommendations.sort_values("Similarity", ascending=False).head(top_n)
+
+st.subheader("Pemain dengan statistik serupa")
+for rank, (_, player) in enumerate(recommendations.iterrows(), start=1):
+    left, right = st.columns([5, 1])
+    with left:
+        st.markdown(
+            f"""
+            <div class="rec-card">
+              <div class="rec-name">{rank}. {player['Player']}</div>
+              <div class="rec-meta">{player['Pos']} · {player['Squad']} · {player['Comp']}</div>
+              <div class="rec-meta">Menit bermain: {int(player['Min']):,} · Cluster: {int(player['Cluster'])}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1.1))
-        fig.tight_layout()
+    with right:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="score">Cosine<br>{player["Similarity"]:.3f}</div>',
+            unsafe_allow_html=True,
+        )
 
-        display(fig)
-        plt.close(fig)
+st.caption("Skor Cosine adalah nilai kemiripan statistik, bukan persentase atau peluang.")
 
-# Tombol yang sama akan memperbarui aplikasi dan radar chart.
-tombol_cari.on_click(tampilkan_radar)
-tampilkan_radar()
+st.subheader("Perbandingan profil")
+plot_recommendations = recommendations.head(3)
+percentiles = role_df[features].rank(pct=True)
+if role == "GK" and "GA90" in features:
+    # Kebobolan lebih sedikit berarti performa lebih baik.
+    percentiles["GA90"] = 1 - percentiles["GA90"]
+
+labels_by_feature = {
+    "Gls_per90": "Gol/90",
+    "Ast_per90": "Assist/90",
+    "Sh_per90": "Tembakan/90",
+    "SoT_per90": "Tepat sasaran/90",
+    "Crs_per90": "Umpan silang/90",
+    "TklW_per90": "Tekel/90",
+    "Int_per90": "Intersepsi/90",
+    "GA90": "Kebobolan/90*",
+    "Save%": "Save%",
+    "CS%": "Clean sheet%",
+}
+labels = [labels_by_feature.get(col, col) for col in features]
+angles = np.linspace(0, 2 * np.pi, len(features), endpoint=False).tolist()
+angles += angles[:1]
+fig, ax = plt.subplots(figsize=(7.2, 6.2), subplot_kw={"polar": True})
+
+for index, row in [(selected_index, selected)] + list(plot_recommendations.iterrows()):
+    values = percentiles.loc[index, features].tolist()
+    values += values[:1]
+    ax.plot(angles, values, linewidth=2, label=str(row["Player"]))
+    ax.fill(angles, values, alpha=0.07)
+
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(labels)
+ax.set_ylim(0, 1)
+ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+ax.set_yticklabels(["25", "50", "75", "100"])
+ax.set_title(f"Persentil dibanding pemain {role} lain", pad=22)
+ax.legend(loc="upper left", bbox_to_anchor=(1.05, 1.1))
+fig.tight_layout()
+st.pyplot(fig, use_container_width=True)
+plt.close(fig)
+st.caption("Radar chart menunjukkan persentil di antara pemain dengan peran yang sama. Untuk kiper, GA90 dibalik agar nilai lebih tinggi berarti lebih sedikit kebobolan.")
+
+with st.expander("Lihat tabel statistik lengkap"):
+    display_features = ["Player", "Pos", "Squad", "Min", "Similarity"] + features
+    selected_table = role_df.loc[[selected_index], ["Player", "Pos", "Squad", "Min"] + features].copy()
+    selected_table.insert(4, "Similarity", np.nan)
+    rec_table = recommendations[display_features].copy()
+    st.dataframe(
+        pd.concat([selected_table, rec_table], ignore_index=True).round(3),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with st.expander("Tentang metode"):
+    st.write(
+        "Pemain dibandingkan hanya dengan peran utama yang sama. Statistik pemain lapangan dihitung per 90 menit, "
+        "fitur dinormalisasi menggunakan StandardScaler, lalu peringkat kemiripan dihitung dengan Cosine Similarity. "
+        "K-Means membentuk cluster pemain per peran; label cluster ditampilkan sebagai konteks tambahan."
+    )
+    st.write(f"Data yang memenuhi syarat analisis (minimal {MIN_ANALYSIS_MINUTES} menit): {len(players):,} pemain.")
